@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"errors"
 	"io"
+	"log"
 	"os"
 	"sort"
 	"strconv"
@@ -165,8 +166,8 @@ func Open(path string) (*DB, error) {
 			return nil, err
 		}
 	}
-	// start the background manager.
-	go db.backgroundManager()
+	// don't start the background manager, we plan to shrink explicitly
+	//go db.backgroundManager()
 	return db, nil
 }
 
@@ -780,7 +781,18 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 	data := make([]byte, 4096)
 	parts := make([]string, 0, 8)
 	r := bufio.NewReader(rd)
+	lineNo := 0
+	var discarded []string
+	defer func() {
+		if len(discarded) != 0 {
+			log.Printf("discarded %d segments:\n", len(discarded))
+			for i, segment := range discarded {
+				log.Printf("%d: `%s`\n", i, segment)
+			}
+		}
+	}()
 	for {
+		START:
 		// peek at the first byte. If it's a 'nul' control character then
 		// ignore it and move to the next byte.
 		c, err := r.ReadByte()
@@ -803,11 +815,14 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 		// first we should read the number of parts that the of the command
 		cmdByteSize := int64(0)
 		line, err := r.ReadBytes('\n')
+		lineNo++
 		if err != nil {
 			return totalSize, err
 		}
 		if line[0] != '*' {
-			return totalSize, ErrInvalid
+			log.Printf("Invalid line start: `%s`", line)
+			discarded = append(discarded, string(line))
+			goto START;
 		}
 		cmdByteSize += int64(len(line))
 
@@ -815,16 +830,22 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 		var n int
 		if len(line) == 4 && line[len(line)-2] == '\r' {
 			if line[1] < '0' || line[1] > '9' {
-				return totalSize, ErrInvalid
+				log.Printf("Invalid number: `%s`", line)
+				discarded = append(discarded, string(line))
+				goto START;
 			}
 			n = int(line[1] - '0')
 		} else {
 			if len(line) < 5 || line[len(line)-2] != '\r' {
-				return totalSize, ErrInvalid
+				log.Printf("Invalid line delimiter 1: `%s`", line)
+				discarded = append(discarded, string(line))
+				goto START;
 			}
 			for i := 1; i < len(line)-2; i++ {
 				if line[i] < '0' || line[i] > '9' {
-					return totalSize, ErrInvalid
+					log.Printf("Invalid line 2: `%s`", line)
+					discarded = append(discarded, string(line))
+					goto START;
 				}
 				n = n*10 + int(line[i]-'0')
 			}
@@ -834,27 +855,36 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 		for i := 0; i < n; i++ {
 			// read the number of bytes of the part.
 			line, err := r.ReadBytes('\n')
+			lineNo++
 			if err != nil {
 				return totalSize, err
 			}
 			if line[0] != '$' {
-				return totalSize, ErrInvalid
+				log.Printf("Invalid size: `%s`", line)
+				discarded = append(discarded, strings.Join(parts, "\n") + string(line))
+				goto START;
 			}
 			cmdByteSize += int64(len(line))
 			// convert the string number to and int
 			var n int
 			if len(line) == 4 && line[len(line)-2] == '\r' {
 				if line[1] < '0' || line[1] > '9' {
-					return totalSize, ErrInvalid
+					log.Printf("Invalid command number: `%s`", line)
+					discarded = append(discarded, strings.Join(parts, "\n") + string(line))
+					goto START;
 				}
 				n = int(line[1] - '0')
 			} else {
 				if len(line) < 5 || line[len(line)-2] != '\r' {
-					return totalSize, ErrInvalid
+					log.Printf("Invalid command delimiter: `%s`", line)
+					discarded = append(discarded, strings.Join(parts, "\n") + string(line))
+					goto START;
 				}
 				for i := 1; i < len(line)-2; i++ {
 					if line[i] < '0' || line[i] > '9' {
-						return totalSize, ErrInvalid
+						log.Printf("Invalid command number 2: `%s`", line)
+						discarded = append(discarded, strings.Join(parts, "\n") + string(line))
+						goto START;
 					}
 					n = n*10 + int(line[i]-'0')
 				}
@@ -870,8 +900,11 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 			if _, err = io.ReadFull(r, data[:n+2]); err != nil {
 				return totalSize, err
 			}
+			lineNo++
 			if data[n] != '\r' || data[n+1] != '\n' {
-				return totalSize, ErrInvalid
+				log.Printf("Invalid line end [%d]: `%s`", lineNo, data[:n+2])
+				discarded = append(discarded, strings.Join(parts, "\n") + string(line) + string(data[:n+2]))
+				goto START;
 			}
 			// copy string
 			parts = append(parts, string(data[:n]))
@@ -887,11 +920,15 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 			(parts[0][2] == 't' || parts[0][2] == 'T') {
 			// SET
 			if len(parts) < 3 || len(parts) == 4 || len(parts) > 5 {
-				return totalSize, ErrInvalid
+				log.Printf("Invalid SET 1: %#v", parts)
+				discarded = append(discarded, strings.Join(parts, " "))
+				goto START;
 			}
 			if len(parts) == 5 {
 				if strings.ToLower(parts[3]) != "ex" {
-					return totalSize, ErrInvalid
+					log.Printf("Invalid SET 2: %#v", parts)
+					discarded = append(discarded, strings.Join(parts, " "))
+					goto START;
 				}
 				ex, err := strconv.ParseUint(parts[4], 10, 64)
 				if err != nil {
@@ -917,7 +954,9 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 			(parts[0][2] == 'l' || parts[0][2] == 'L') {
 			// DEL
 			if len(parts) != 2 {
-				return totalSize, ErrInvalid
+				log.Printf("Invalid DEL: %#v", parts)
+				discarded = append(discarded, strings.Join(parts, " "))
+				goto START;
 			}
 			db.deleteFromDatabase(&dbItem{key: parts[1]})
 		} else if (parts[0][0] == 'f' || parts[0][0] == 'F') &&
@@ -926,7 +965,9 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 			db.exps = btreeNew(lessCtx(&exctx{db}))
 			db.idxs = make(map[string]*index)
 		} else {
-			return totalSize, ErrInvalid
+			log.Printf("Unknown command: %#v", parts)
+			discarded = append(discarded, strings.Join(parts, " "))
+			goto START;
 		}
 		totalSize += cmdByteSize
 	}
